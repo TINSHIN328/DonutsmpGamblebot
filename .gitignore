@@ -1,5 +1,33 @@
+# Dependencies
 node_modules/
-.next/
+
+# Environment
+.env
+
+# Data (database, backups)
+data/
+
+# Logs
+logs/
+
+# Build output
 dist/
+
+# PM2
+.pm2/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Debug
+npm-debug.log*
+.next/
 build/
 *.log
