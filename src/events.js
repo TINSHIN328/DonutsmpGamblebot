@@ -16,6 +16,7 @@ import * as auth from './auth.js';
 import * as minecraft from './minecraft.js';
 import * as ui from './ui.js';
 import { isAdmin, validateAmount, checkCommandRateLimit, checkWithdrawCooldown, updateWithdrawTracking, checkDailyWithdrawal } from './security.js';
+import { getExtendedCommands, handleExtendedCommand, handleGameButton } from './commands.js';
 
 const log = createLogger('events');
 
@@ -33,7 +34,8 @@ export function getChannel(channelId) {
  * Define all slash commands.
  */
 function getCommandDefinitions() {
-  return [
+  // Combine base commands with extended commands
+  const baseCommands = [
     // === Account Commands ===
     new SlashCommandBuilder()
       .setName('link')
@@ -201,6 +203,10 @@ function getCommandDefinitions() {
       .addStringOption(opt => opt.setName('transaction_id').setDescription('Transaction ID').setRequired(true))
       .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
   ];
+
+  // Combine with extended commands
+  const extendedCommands = getExtendedCommands();
+  return [...baseCommands, ...extendedCommands];
 }
 
 /**
@@ -314,6 +320,31 @@ async function handleCommand(interaction) {
     case 'database-status': await handleDatabaseStatus(interaction); break;
     case 'refund': await handleRefund(interaction); break;
     case 'transaction': await handleTransaction(interaction); break;
+
+    // Extended commands (delegated to commands.js)
+    case 'balance':
+    case 'pay':
+    case 'baltop':
+    case 'info':
+    case 'blackjack':
+    case 'slots':
+    case 'chicken':
+    case 'keno':
+    case 'limbo':
+    case 'mines':
+    case 'tower':
+    case 'redeem':
+    case 'rakeback':
+    case 'invites':
+    case 'advertisement':
+    case 'games':
+    case 'provablyfair':
+    case 'help':
+    case 'refreshroles':
+    case 'giveaway':
+    case 'forcewithdraw':
+      await handleExtendedCommand(interaction);
+      break;
 
     default:
       await interaction.reply({ content: '❓ Unknown command.', ephemeral: true });
@@ -998,9 +1029,15 @@ async function handleTransaction(interaction) {
 async function handleButton(interaction) {
   const customId = interaction.customId;
 
+  // Handle game buttons (blackjack, mines, tower, chicken, etc.)
+  const gamePrefixes = ['bj_', 'mines_', 'tower_', 'chicken_', 'rakeback_', 'giveaway_'];
+  if (gamePrefixes.some(prefix => customId.startsWith(prefix))) {
+    await handleGameButton(interaction);
+    return;
+  }
+
   // Handle pagination buttons
   if (customId.includes('_prev') || customId.includes('_next') || customId.includes('_first') || customId.includes('_last')) {
-    // Pagination logic would go here
     await interaction.reply({ content: '⏳ Pagination is handled via message updates.', ephemeral: true });
     return;
   }

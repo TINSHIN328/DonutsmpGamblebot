@@ -6,6 +6,7 @@
 import Database from 'better-sqlite3';
 import fs from 'fs';
 import path from 'path';
+import crypto from 'crypto';
 import config from './config.js';
 import { createLogger } from './logger.js';
 
@@ -257,6 +258,167 @@ function runMigrations() {
           announced_at TEXT NOT NULL DEFAULT (datetime('now')),
           FOREIGN KEY (game_id) REFERENCES games(game_id)
         );
+      `
+    },
+    {
+      name: '003_rewards_and_giveaways',
+      sql: `
+        -- Promo/redeem codes
+        CREATE TABLE IF NOT EXISTS promo_codes (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          code TEXT NOT NULL UNIQUE,
+          amount INTEGER NOT NULL,
+          max_uses INTEGER NOT NULL DEFAULT 1,
+          per_user_limit INTEGER NOT NULL DEFAULT 1,
+          current_uses INTEGER NOT NULL DEFAULT 0,
+          min_account_age_days INTEGER NOT NULL DEFAULT 0,
+          enabled INTEGER NOT NULL DEFAULT 1,
+          expires_at TEXT,
+          created_by TEXT NOT NULL,
+          created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
+        -- Code redemptions
+        CREATE TABLE IF NOT EXISTS code_redemptions (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          code_id INTEGER NOT NULL,
+          user_id INTEGER NOT NULL,
+          amount INTEGER NOT NULL,
+          transaction_id TEXT NOT NULL,
+          redeemed_at TEXT NOT NULL DEFAULT (datetime('now')),
+          FOREIGN KEY (code_id) REFERENCES promo_codes(id),
+          UNIQUE(code_id, user_id)
+        );
+
+        -- Invite/referral tracking
+        CREATE TABLE IF NOT EXISTS invites (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          inviter_user_id INTEGER NOT NULL,
+          invitee_discord_id TEXT NOT NULL UNIQUE,
+          invitee_user_id INTEGER,
+          eligible INTEGER NOT NULL DEFAULT 0,
+          reward_claimed INTEGER NOT NULL DEFAULT 0,
+          joined_at TEXT NOT NULL DEFAULT (datetime('now')),
+          FOREIGN KEY (inviter_user_id) REFERENCES users(id)
+        );
+
+        -- Rakeback tracking
+        CREATE TABLE IF NOT EXISTS rakeback (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          user_id INTEGER NOT NULL UNIQUE,
+          total_wagered INTEGER NOT NULL DEFAULT 0,
+          total_rakeback INTEGER NOT NULL DEFAULT 0,
+          last_claimed_at TEXT,
+          FOREIGN KEY (user_id) REFERENCES users(id)
+        );
+
+        -- Giveaways
+        CREATE TABLE IF NOT EXISTS giveaways (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          giveaway_id TEXT NOT NULL UNIQUE,
+          guild_id TEXT NOT NULL,
+          channel_id TEXT NOT NULL,
+          message_id TEXT,
+          prize TEXT NOT NULL,
+          amount INTEGER NOT NULL DEFAULT 0,
+          winners_count INTEGER NOT NULL DEFAULT 1,
+          min_wagered INTEGER NOT NULL DEFAULT 0,
+          min_games INTEGER NOT NULL DEFAULT 0,
+          min_balance INTEGER NOT NULL DEFAULT 0,
+          status TEXT NOT NULL DEFAULT 'ACTIVE' CHECK(status IN ('ACTIVE', 'ENDED', 'CANCELLED')),
+          ends_at TEXT NOT NULL,
+          created_by TEXT NOT NULL,
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          ended_at TEXT
+        );
+
+        -- Giveaway entries
+        CREATE TABLE IF NOT EXISTS giveaway_entries (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          giveaway_id TEXT NOT NULL,
+          user_id INTEGER NOT NULL,
+          entered_at TEXT NOT NULL DEFAULT (datetime('now')),
+          FOREIGN KEY (giveaway_id) REFERENCES giveaways(giveaway_id),
+          UNIQUE(giveaway_id, user_id)
+        );
+
+        -- Giveaway winners
+        CREATE TABLE IF NOT EXISTS giveaway_winners (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          giveaway_id TEXT NOT NULL,
+          user_id INTEGER NOT NULL,
+          amount INTEGER NOT NULL DEFAULT 0,
+          transaction_id TEXT,
+          awarded_at TEXT NOT NULL DEFAULT (datetime('now')),
+          FOREIGN KEY (giveaway_id) REFERENCES giveaways(giveaway_id)
+        );
+
+        -- Active game sessions (for interactive games like blackjack, mines)
+        CREATE TABLE IF NOT EXISTS active_sessions (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          session_id TEXT NOT NULL UNIQUE,
+          user_id INTEGER NOT NULL,
+          game_type TEXT NOT NULL,
+          game_id TEXT NOT NULL,
+          bet_amount INTEGER NOT NULL,
+          session_data TEXT NOT NULL,
+          status TEXT NOT NULL DEFAULT 'ACTIVE' CHECK(status IN ('ACTIVE', 'COMPLETED', 'EXPIRED', 'CANCELLED')),
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          expires_at TEXT NOT NULL,
+          FOREIGN KEY (game_id) REFERENCES games(game_id)
+        );
+
+        -- Role sync configuration
+        CREATE TABLE IF NOT EXISTS role_sync_config (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          guild_id TEXT NOT NULL,
+          role_id TEXT NOT NULL,
+          requirement_type TEXT NOT NULL,
+          requirement_value INTEGER NOT NULL,
+          updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+          UNIQUE(guild_id, role_id)
+        );
+
+        -- Indexes for new tables
+        CREATE INDEX IF NOT EXISTS idx_promo_codes_code ON promo_codes(code);
+        CREATE INDEX IF NOT EXISTS idx_code_redemptions_user ON code_redemptions(user_id);
+        CREATE INDEX IF NOT EXISTS idx_invites_inviter ON invites(inviter_user_id);
+        CREATE INDEX IF NOT EXISTS idx_invites_invitee ON invites(invitee_discord_id);
+        CREATE INDEX IF NOT EXISTS idx_giveaways_status ON giveaways(status);
+        CREATE INDEX IF NOT EXISTS idx_giveaway_entries_giveaway ON giveaway_entries(giveaway_id);
+        CREATE INDEX IF NOT EXISTS idx_active_sessions_user ON active_sessions(user_id);
+        CREATE INDEX IF NOT EXISTS idx_active_sessions_status ON active_sessions(status);
+      `
+    },
+    {
+      name: '004_game_settings',
+      sql: `
+        -- Per-game enabled/disabled settings
+        CREATE TABLE IF NOT EXISTS game_settings (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          game_type TEXT NOT NULL UNIQUE,
+          enabled INTEGER NOT NULL DEFAULT 1,
+          min_bet INTEGER,
+          max_bet INTEGER,
+          house_edge INTEGER NOT NULL DEFAULT 0,
+          cooldown_seconds INTEGER NOT NULL DEFAULT 5,
+          updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
+        -- Insert default game settings
+        INSERT OR IGNORE INTO game_settings (game_type, enabled, cooldown_seconds) VALUES
+          ('coinflip', 1, 5),
+          ('blackjack', 1, 10),
+          ('roulette', 1, 5),
+          ('slots', 1, 3),
+          ('dice', 1, 5),
+          ('chicken', 1, 5),
+          ('keno', 1, 10),
+          ('limbo', 1, 5),
+          ('mines', 1, 10),
+          ('tower', 1, 10),
+          ('highlow', 1, 5),
+          ('crash', 1, 5);
       `
     }
   ];
@@ -1102,4 +1264,417 @@ export function getUserProfile(discordUserId) {
   const mcAccount = getMinecraftAccount(user.id);
 
   return { user, wallet, mcAccount };
+}
+
+// ============================================================
+// EXTENDED FEATURES - Rewards, Giveaways, Sessions
+// ============================================================
+
+/**
+ * Get balance leaderboard (for /baltop).
+ */
+export function getBalanceLeaderboard(limit = 10, offset = 0) {
+  return db.prepare(`
+    SELECT u.discord_user_id, w.balance, w.games_played, w.total_wagered
+    FROM wallets w
+    JOIN users u ON u.id = w.user_id
+    ORDER BY w.balance DESC
+    LIMIT ? OFFSET ?
+  `).all(limit, offset);
+}
+
+/**
+ * Count total users with wallets.
+ */
+export function countWalletUsers() {
+  return db.prepare('SELECT COUNT(*) as count FROM wallets').get().count;
+}
+
+/**
+ * Process a user-to-user payment (atomic).
+ */
+export function processPayment(senderUserId, recipientUserId, amount) {
+  const payment = db.transaction(() => {
+    const senderWallet = db.prepare('SELECT * FROM wallets WHERE user_id = ?').get(senderUserId);
+    const recipientWallet = db.prepare('SELECT * FROM wallets WHERE user_id = ?').get(recipientUserId);
+
+    if (!senderWallet) throw new Error('Sender wallet not found');
+    if (!recipientWallet) throw new Error('Recipient wallet not found');
+    if (senderWallet.balance < amount) throw new Error('INSUFFICIENT_BALANCE');
+    if (senderUserId === recipientUserId) throw new Error('SELF_PAYMENT');
+
+    const txnId = `PAY-${senderUserId}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
+    // Deduct from sender
+    const senderNewBalance = senderWallet.balance - amount;
+    db.prepare(`
+      INSERT INTO wallet_transactions (transaction_id, user_id, wallet_id, type, amount, balance_before, balance_after, status, reference_type, reference_id, reason)
+      VALUES (?, ?, ?, 'WITHDRAW', ?, ?, ?, 'COMPLETED', 'PAYMENT', ?, 'Payment sent')
+    `).run(txnId, senderUserId, senderWallet.id, -amount, senderWallet.balance, senderNewBalance, txnId);
+    db.prepare('UPDATE wallets SET balance = ? WHERE id = ?').run(senderNewBalance, senderWallet.id);
+
+    // Credit to recipient
+    const recipientNewBalance = recipientWallet.balance + amount;
+    db.prepare(`
+      INSERT INTO wallet_transactions (transaction_id, user_id, wallet_id, type, amount, balance_before, balance_after, status, reference_type, reference_id, reason)
+      VALUES (?, ?, ?, 'DEPOSIT', ?, ?, ?, 'COMPLETED', 'PAYMENT', ?, 'Payment received')
+    `).run(txnId + '-R', recipientUserId, recipientWallet.id, amount, recipientWallet.balance, recipientNewBalance, txnId);
+    db.prepare('UPDATE wallets SET balance = ? WHERE id = ?').run(recipientNewBalance, recipientWallet.id);
+
+    return { transactionId: txnId, senderNewBalance, recipientNewBalance };
+  });
+
+  return payment();
+}
+
+/**
+ * Check if a user has an active game session.
+ */
+export function hasActiveSession(userId) {
+  return db.prepare(`
+    SELECT * FROM active_sessions
+    WHERE user_id = ? AND status = 'ACTIVE' AND expires_at > datetime('now')
+    LIMIT 1
+  `).get(userId);
+}
+
+/**
+ * Create an active game session.
+ */
+export function createSession(userId, gameType, gameId, betAmount, sessionData, expiresMinutes = 5) {
+  const sessionId = `SES-${userId}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  db.prepare(`
+    INSERT INTO active_sessions (session_id, user_id, game_type, game_id, bet_amount, session_data, expires_at)
+    VALUES (?, ?, ?, ?, ?, ?, datetime('now', ? || ' minutes'))
+  `).run(sessionId, userId, gameType, gameId, betAmount, JSON.stringify(sessionData), expiresMinutes);
+  return sessionId;
+}
+
+/**
+ * Get an active session.
+ */
+export function getSession(sessionId) {
+  return db.prepare(`
+    SELECT * FROM active_sessions
+    WHERE session_id = ? AND status = 'ACTIVE' AND expires_at > datetime('now')
+  `).get(sessionId);
+}
+
+/**
+ * Update session data.
+ */
+export function updateSession(sessionId, sessionData) {
+  db.prepare('UPDATE active_sessions SET session_data = ? WHERE session_id = ?')
+    .run(JSON.stringify(sessionData), sessionId);
+}
+
+/**
+ * Complete a session.
+ */
+export function completeSession(sessionId) {
+  db.prepare("UPDATE active_sessions SET status = 'COMPLETED' WHERE session_id = ?").run(sessionId);
+}
+
+/**
+ * Cancel a session.
+ */
+export function cancelSession(sessionId) {
+  db.prepare("UPDATE active_sessions SET status = 'CANCELLED' WHERE session_id = ?").run(sessionId);
+}
+
+/**
+ * Get game setting.
+ */
+export function getGameSetting(gameType) {
+  return db.prepare('SELECT * FROM game_settings WHERE game_type = ?').get(gameType);
+}
+
+/**
+ * Check if a game is enabled.
+ */
+export function isGameEnabled(gameType) {
+  const setting = getGameSetting(gameType);
+  if (!setting) return true; // Default enabled
+  return setting.enabled === 1;
+}
+
+/**
+ * Set game enabled/disabled.
+ */
+export function setGameEnabled(gameType, enabled) {
+  db.prepare(`
+    INSERT INTO game_settings (game_type, enabled) VALUES (?, ?)
+    ON CONFLICT(game_type) DO UPDATE SET enabled = excluded.enabled, updated_at = datetime('now')
+  `).run(gameType, enabled ? 1 : 0);
+}
+
+/**
+ * Get all game settings.
+ */
+export function getAllGameSettings() {
+  return db.prepare('SELECT * FROM game_settings ORDER BY game_type').all();
+}
+
+/**
+ * Create a promo code.
+ */
+export function createPromoCode(code, amount, maxUses, perUserLimit, minAccountAgeDays, expiresAt, createdBy) {
+  db.prepare(`
+    INSERT INTO promo_codes (code, amount, max_uses, per_user_limit, min_account_age_days, expires_at, created_by)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `).run(code.toUpperCase(), amount, maxUses, perUserLimit, minAccountAgeDays, expiresAt, createdBy);
+}
+
+/**
+ * Get a promo code.
+ */
+export function getPromoCode(code) {
+  return db.prepare('SELECT * FROM promo_codes WHERE code = ?').get(code.toUpperCase());
+}
+
+/**
+ * Redeem a promo code (atomic).
+ */
+export function redeemPromoCode(userId, code, discordUserId) {
+  const redeem = db.transaction(() => {
+    const promo = db.prepare('SELECT * FROM promo_codes WHERE code = ? AND enabled = 1').get(code.toUpperCase());
+    if (!promo) throw new Error('CODE_NOT_FOUND');
+    if (promo.expires_at && new Date(promo.expires_at) < new Date()) throw new Error('CODE_EXPIRED');
+    if (promo.current_uses >= promo.max_uses) throw new Error('CODE_MAXED_OUT');
+
+    // Check per-user limit
+    const userRedemptions = db.prepare(
+      'SELECT COUNT(*) as count FROM code_redemptions WHERE code_id = ? AND user_id = ?'
+    ).get(promo.id, userId).count;
+    if (userRedemptions >= promo.per_user_limit) throw new Error('ALREADY_REDEEMED');
+
+    // Check account age
+    if (promo.min_account_age_days > 0) {
+      const user = db.prepare('SELECT created_at FROM users WHERE id = ?').get(userId);
+      const accountAge = (Date.now() - new Date(user.created_at).getTime()) / (1000 * 60 * 60 * 24);
+      if (accountAge < promo.min_account_age_days) {
+        throw new Error(`ACCOUNT_TOO_YOUNG: Account must be at least ${promo.min_account_age_days} days old`);
+      }
+    }
+
+    // Credit the wallet
+    const wallet = db.prepare('SELECT * FROM wallets WHERE user_id = ?').get(userId);
+    if (!wallet) throw new Error('WALLET_NOT_FOUND');
+
+    const txnId = `REDEEM-${code}-${userId}-${Date.now()}`;
+    const newBalance = wallet.balance + promo.amount;
+
+    db.prepare(`
+      INSERT INTO wallet_transactions (transaction_id, user_id, wallet_id, type, amount, balance_before, balance_after, status, reference_type, reference_id, reason)
+      VALUES (?, ?, ?, 'DEPOSIT', ?, ?, ?, 'COMPLETED', 'PROMO', ?, 'Promo code redemption')
+    `).run(txnId, userId, wallet.id, promo.amount, wallet.balance, newBalance, promo.code);
+
+    db.prepare('UPDATE wallets SET balance = ? WHERE id = ?').run(newBalance, wallet.id);
+
+    // Record redemption
+    db.prepare('INSERT INTO code_redemptions (code_id, user_id, amount, transaction_id) VALUES (?, ?, ?, ?)')
+      .run(promo.id, userId, promo.amount, txnId);
+
+    // Update usage count
+    db.prepare('UPDATE promo_codes SET current_uses = current_uses + 1 WHERE id = ?').run(promo.id);
+
+    return { transactionId: txnId, amount: promo.amount, newBalance };
+  });
+
+  return redeem();
+}
+
+/**
+ * Record an invite.
+ */
+export function recordInvite(inviterUserId, inviteeDiscordId) {
+  // Check for self-referral
+  const inviter = db.prepare('SELECT discord_user_id FROM users WHERE id = ?').get(inviterUserId);
+  if (inviter && inviter.discord_user_id === inviteeDiscordId) {
+    throw new Error('SELF_REFERRAL');
+  }
+
+  // Check if already invited
+  const existing = db.prepare('SELECT * FROM invites WHERE invitee_discord_id = ?').get(inviteeDiscordId);
+  if (existing) throw new Error('ALREADY_INVITED');
+
+  db.prepare('INSERT INTO invites (inviter_user_id, invitee_discord_id) VALUES (?, ?)')
+    .run(inviterUserId, inviteeDiscordId);
+}
+
+/**
+ * Get invites for a user.
+ */
+export function getUserInvites(userId) {
+  return db.prepare(`
+    SELECT i.*, u.discord_user_id as invitee_discord
+    FROM invites i
+    LEFT JOIN users u ON u.id = i.invitee_user_id
+    WHERE i.inviter_user_id = ?
+    ORDER BY i.joined_at DESC
+  `).all(userId);
+}
+
+/**
+ * Get rakeback info for a user.
+ */
+export function getRakebackInfo(userId) {
+  return db.prepare('SELECT * FROM rakeback WHERE user_id = ?').get(userId);
+}
+
+/**
+ * Update rakeback tracking.
+ */
+export function updateRakebackWagered(userId, wagerAmount) {
+  db.prepare(`
+    INSERT INTO rakeback (user_id, total_wagered) VALUES (?, ?)
+    ON CONFLICT(user_id) DO UPDATE SET total_wagered = total_wagered + excluded.total_wagered
+  `).run(userId, wagerAmount);
+}
+
+/**
+ * Claim rakeback (atomic).
+ */
+export function claimRakeback(userId, rakebackPercent) {
+  const claim = db.transaction(() => {
+    const rakeback = db.prepare('SELECT * FROM rakeback WHERE user_id = ?').get(userId);
+    if (!rakeback || rakeback.total_wagered === 0) throw new Error('NO_RAKEBACK');
+
+    const wallet = db.prepare('SELECT * FROM wallets WHERE user_id = ?').get(userId);
+    const rakebackAmount = Math.floor(rakeback.total_wagered * rakebackPercent / 100);
+
+    if (rakebackAmount <= 0) throw new Error('NO_RAKEBACK');
+
+    const txnId = `RAKE-${userId}-${Date.now()}`;
+    const newBalance = wallet.balance + rakebackAmount;
+
+    db.prepare(`
+      INSERT INTO wallet_transactions (transaction_id, user_id, wallet_id, type, amount, balance_before, balance_after, status, reference_type, reference_id, reason)
+      VALUES (?, ?, ?, 'DEPOSIT', ?, ?, ?, 'COMPLETED', 'RAKEBACK', ?, 'Rakeback claim')
+    `).run(txnId, userId, wallet.id, rakebackAmount, wallet.balance, newBalance, txnId);
+
+    db.prepare('UPDATE wallets SET balance = ? WHERE id = ?').run(newBalance, wallet.id);
+    db.prepare('UPDATE rakeback SET total_wagered = 0, total_rakeback = total_rakeback + ?, last_claimed_at = datetime(\'now\') WHERE user_id = ?')
+      .run(rakebackAmount, userId);
+
+    return { transactionId: txnId, amount: rakebackAmount, newBalance };
+  });
+
+  return claim();
+}
+
+/**
+ * Create a giveaway.
+ */
+export function createGiveaway(giveawayId, guildId, channelId, prize, amount, winnersCount, minWagered, minGames, minBalance, endsAt, createdBy) {
+  db.prepare(`
+    INSERT INTO giveaways (giveaway_id, guild_id, channel_id, prize, amount, winners_count, min_wagered, min_games, min_balance, ends_at, created_by)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(giveawayId, guildId, channelId, prize, amount, winnersCount, minWagered, minGames, minBalance, endsAt, createdBy);
+}
+
+/**
+ * Enter a giveaway.
+ */
+export function enterGiveaway(giveawayId, userId) {
+  const giveaway = db.prepare('SELECT * FROM giveaways WHERE giveaway_id = ? AND status = \'ACTIVE\'').get(giveawayId);
+  if (!giveaway) throw new Error('GIVEAWAY_NOT_FOUND');
+  if (new Date(giveaway.ends_at) < new Date()) throw new Error('GIVEAWAY_ENDED');
+
+  // Check requirements
+  const wallet = db.prepare('SELECT * FROM wallets WHERE user_id = ?').get(userId);
+  if (wallet) {
+    if (wallet.total_wagered < giveaway.min_wagered) throw new Error('MIN_WAGER_NOT_MET');
+    if (wallet.games_played < giveaway.min_games) throw new Error('MIN_GAMES_NOT_MET');
+    if (wallet.balance < giveaway.min_balance) throw new Error('MIN_BALANCE_NOT_MET');
+  }
+
+  db.prepare('INSERT OR IGNORE INTO giveaway_entries (giveaway_id, user_id) VALUES (?, ?)')
+    .run(giveawayId, userId);
+}
+
+/**
+ * End a giveaway and select winners.
+ */
+export function endGiveaway(giveawayId) {
+  const giveaway = db.prepare('SELECT * FROM giveaways WHERE giveaway_id = ?').get(giveawayId);
+  if (!giveaway) throw new Error('GIVEAWAY_NOT_FOUND');
+
+  const entries = db.prepare('SELECT * FROM giveaway_entries WHERE giveaway_id = ?').all(giveawayId);
+  if (entries.length === 0) {
+    db.prepare("UPDATE giveaways SET status = 'ENDED', ended_at = datetime('now') WHERE giveaway_id = ?").run(giveawayId);
+    return { winners: [] };
+  }
+
+  // Secure random winner selection
+  const winners = [];
+  const remaining = [...entries];
+
+  for (let i = 0; i < Math.min(giveaway.winners_count, remaining.length); i++) {
+    const idx = crypto.randomInt(remaining.length);
+    winners.push(remaining[idx]);
+    remaining.splice(idx, 1);
+  }
+
+  // Credit winners
+  const amountPerWinner = Math.floor(giveaway.amount / giveaway.winners_count);
+  for (const winner of winners) {
+    if (amountPerWinner > 0) {
+      const wallet = db.prepare('SELECT * FROM wallets WHERE user_id = ?').get(winner.user_id);
+      const txnId = `GIVEAWAY-${giveawayId}-${winner.user_id}-${Date.now()}`;
+      const newBalance = wallet.balance + amountPerWinner;
+
+      db.prepare(`
+        INSERT INTO wallet_transactions (transaction_id, user_id, wallet_id, type, amount, balance_before, balance_after, status, reference_type, reference_id, reason)
+        VALUES (?, ?, ?, 'DEPOSIT', ?, ?, ?, 'COMPLETED', 'GIVEAWAY', ?, 'Giveaway win')
+      `).run(txnId, winner.user_id, wallet.id, amountPerWinner, wallet.balance, newBalance, giveawayId);
+
+      db.prepare('UPDATE wallets SET balance = ? WHERE id = ?').run(newBalance, wallet.id);
+
+      db.prepare('INSERT INTO giveaway_winners (giveaway_id, user_id, amount, transaction_id) VALUES (?, ?, ?, ?)')
+        .run(giveawayId, winner.user_id, amountPerWinner, txnId);
+    }
+  }
+
+  db.prepare("UPDATE giveaways SET status = 'ENDED', ended_at = datetime('now') WHERE giveaway_id = ?").run(giveawayId);
+
+  return { winners, amountPerWinner };
+}
+
+/**
+ * Get active giveaways.
+ */
+export function getActiveGiveaways(guildId) {
+  return db.prepare(`
+    SELECT * FROM giveaways WHERE guild_id = ? AND status = 'ACTIVE' AND ends_at > datetime('now')
+    ORDER BY ends_at ASC
+  `).all(guildId);
+}
+
+/**
+ * Get role sync config.
+ */
+export function getRoleSyncConfig(guildId) {
+  return db.prepare('SELECT * FROM role_sync_config WHERE guild_id = ?').all(guildId);
+}
+
+/**
+ * Set role sync config.
+ */
+export function setRoleSyncConfig(guildId, roleId, requirementType, requirementValue) {
+  db.prepare(`
+    INSERT INTO role_sync_config (guild_id, role_id, requirement_type, requirement_value)
+    VALUES (?, ?, ?, ?)
+    ON CONFLICT(guild_id, role_id) DO UPDATE SET
+      requirement_type = excluded.requirement_type,
+      requirement_value = excluded.requirement_value,
+      updated_at = datetime('now')
+  `).run(guildId, roleId, requirementType, requirementValue);
+}
+
+/**
+ * Remove role sync config.
+ */
+export function removeRoleSyncConfig(guildId, roleId) {
+  db.prepare('DELETE FROM role_sync_config WHERE guild_id = ? AND role_id = ?').run(guildId, roleId);
 }
