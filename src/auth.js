@@ -1,224 +1,314 @@
 /**
- * DonutSMP Bot - Microsoft/Minecraft Authentication Module
- * Uses Mineflayer's built-in Microsoft auth (device code flow).
- * NEVER stores passwords or tokens.
+ * Account Linking System
+ * Handles Minecraft account linking via payment verification.
  * 
  * Flow:
  * 1. User runs /link
- * 2. Bot generates a unique link code
- * 3. User authenticates via Microsoft (handled by Mineflayer)
- * 4. On success, we get the Minecraft UUID and username
- * 5. Store the mapping in the database
- * 
- * The actual Microsoft auth is handled by Mineflayer internally.
- * We never see or store the user's password or access tokens.
+ * 2. Bot generates a random challenge amount (1-100)
+ * 3. User sends payment to bot's MC account with that exact amount
+ * 4. Payment monitor detects the payment
+ * 5. Bot verifies the payment matches the challenge
+ * 6. Account is linked
  */
-import { createLogger, logSecurityEvent } from './logger.js';
-import * as db from './database.js';
+
+import crypto from 'crypto';
+import { createLogger } from '../logger.js';
+import * as db from '../database.js';
+import { paymentMonitor } from '../minecraft/payment-monitor.js';
 
 const log = createLogger('auth');
 
-// Pending link requests (code -> { discordUserId, timestamp, resolve, reject })
-const pendingLinks = new Map();
-
-// Link codes expire after 5 minutes
-const LINK_CODE_EXPIRY = 5 * 60 * 1000;
-
 /**
- * Generate a unique link code for account linking.
+ * Generate a cryptographically secure random challenge amount (1-100)
+ * @returns {number} - Random integer between 1 and 100
  */
-function generateLinkCode() {
-  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // No ambiguous chars
-  let code = '';
-  for (let i = 0; i < 8; i++) {
-    code += chars[Math.floor(Math.random() * chars.length)];
-  }
-  return code;
+export function generateChallengeAmount() {
+  return crypto.randomInt(1, 101); // randomInt is exclusive of upper bound
 }
 
 /**
- * Create a new link request.
- * Returns a link code that the user must use to authenticate.
+ * Create a new link session for a Discord user
+ * @param {string} discordUserId - Discord user ID
+ * @returns {Object} - Link session details
  */
-export function createLinkRequest(discordUserId) {
-  // Check if user already has a pending request
-  for (const [code, request] of pendingLinks.entries()) {
-    if (request.discordUserId === discordUserId) {
-      return { code, existing: true };
-    }
-  }
-
+export function createLinkSession(discordUserId) {
   // Check if user already has a linked account
   const user = db.getUserByDiscordId(discordUserId);
   if (user) {
-    const mcAccount = db.getMinecraftAccount(user.id);
-    if (mcAccount) {
-      throw new Error('ALREADY_LINKED: Your account is already linked. Use /unlink first to change it.');
+    const existingAccount = db.getMinecraftAccount(user.id);
+    if (existingAccount) {
+      throw new Error(`You already have a linked Minecraft account: ${existingAccount.minecraft_username}`);
     }
   }
 
-  const code = generateLinkCode();
-  pendingLinks.set(code, {
+  // Check for existing pending session
+  const existingSession = db.getActiveLinkSession(discordUserId);
+  if (existingSession) {
+    // Cancel the old session
+    db.cancelLinkSession(existingSession.session_id);
+    log.info({ discordUserId, oldSessionId: existingSession.session_id }, 'Cancelled existing link session');
+  }
+
+  // Generate challenge amount
+  const challengeAmount = generateChallengeAmount();
+
+  // Check for collisions with other active sessions
+  const collidingSessions = db.findLinkSessionsByAmount(challengeAmount);
+  if (collidingSessions.length > 0) {
+    // Try to find a unique amount (up to 10 attempts)
+    let attempts = 0;
+    let uniqueAmount = challengeAmount;
+    
+    while (attempts < 10) {
+      uniqueAmount = generateChallengeAmount();
+      const collisions = db.findLinkSessionsByAmount(uniqueAmount);
+      if (collisions.length === 0) {
+        break;
+      }
+      attempts++;
+    }
+
+    if (attempts >= 10) {
+      throw new Error('Unable to generate unique challenge amount. Please try again in a few seconds.');
+    }
+
+    challengeAmount = uniqueAmount;
+  }
+
+  // Create the session
+  const session = db.createLinkSession(discordUserId, challengeAmount);
+
+  log.info({
     discordUserId,
-    timestamp: Date.now(),
-  });
+    sessionId: session.sessionId,
+    challengeAmount,
+    expiresAt: session.expiresAt
+  }, 'Created link session');
 
-  // Clean up expired codes
-  cleanExpiredLinks();
-
-  log.info({ discordUserId, code }, 'Link request created');
-  return { code, existing: false };
+  return {
+    sessionId: session.sessionId,
+    challengeAmount: session.challengeAmount,
+    expiresAt: session.expiresAt,
+    botUsername: paymentMonitor.botUsername
+  };
 }
 
 /**
- * Complete a link request after successful Minecraft authentication.
- * Called when Mineflayer successfully authenticates.
+ * Cancel a link session
+ * @param {string} discordUserId - Discord user ID
  */
-export function completeLinkRequest(discordUserId, minecraftUuid, minecraftUsername) {
-  // Find the pending request for this Discord user
-  let linkCode = null;
-  for (const [code, request] of pendingLinks.entries()) {
-    if (request.discordUserId === discordUserId) {
-      linkCode = code;
-      break;
-    }
-  }
-
-  if (!linkCode) {
-    log.warn({ discordUserId }, 'No pending link request found');
-    return false;
-  }
-
-  try {
-    // Get or create user
-    let user = db.getUserByDiscordId(discordUserId);
-    let userId;
-
-    if (!user) {
-      userId = db.createUser(discordUserId, null);
-    } else {
-      userId = user.id;
-    }
-
-    // Link the Minecraft account
-    db.linkMinecraftAccount(userId, minecraftUuid, minecraftUsername);
-
-    // Create wallet
-    db.getOrCreateWallet(userId);
-
-    // Remove pending request
-    pendingLinks.delete(linkCode);
-
-    // Audit log
-    db.recordAuditLog('ACCOUNT_LINKED', discordUserId, minecraftUuid, null, null, 'SUCCESS',
-      JSON.stringify({ minecraftUsername }));
-
-    log.info({ discordUserId, minecraftUuid, minecraftUsername }, 'Account linked successfully');
-    return true;
-  } catch (error) {
-    log.error({ error: error.message, discordUserId }, 'Failed to complete link');
-    throw error;
+export function cancelLinkSession(discordUserId) {
+  const session = db.getActiveLinkSession(discordUserId);
+  if (session) {
+    db.cancelLinkSession(session.session_id);
+    log.info({ discordUserId, sessionId: session.session_id }, 'Cancelled link session');
   }
 }
 
 /**
- * Unlink a user's Minecraft account.
+ * Get active link session for a Discord user
+ * @param {string} discordUserId - Discord user ID
+ * @returns {Object|null} - Active session or null
+ */
+export function getActiveLinkSession(discordUserId) {
+  return db.getActiveLinkSession(discordUserId);
+}
+
+/**
+ * Complete the linking process after payment verification
+ * Called by payment monitor when a matching payment is detected
+ * 
+ * @param {string} discordUserId - Discord user ID
+ * @param {string} minecraftUsername - Minecraft username from payment
+ * @param {string} sessionId - Link session ID
+ */
+export function completeLinking(discordUserId, minecraftUsername, sessionId) {
+  const session = db.getLinkSession(sessionId);
+  
+  if (!session) {
+    throw new Error('Link session not found');
+  }
+
+  if (session.status !== 'PENDING') {
+    throw new Error('Link session is not pending');
+  }
+
+  if (session.discord_user_id !== discordUserId) {
+    throw new Error('Session does not belong to this user');
+  }
+
+  // Get or create user record
+  let user = db.getUserByDiscordId(discordUserId);
+  let userId;
+
+  if (!user) {
+    userId = db.createUser(discordUserId, null);
+    log.info({ discordUserId, userId }, 'Created new user record');
+  } else {
+    userId = user.id;
+  }
+
+  // Get Minecraft UUID (we'll use the username as a placeholder since we can't query Mojang API here)
+  // In production, you'd want to fetch the actual UUID from Mojang API
+  const minecraftUuid = generateMinecraftUuid(minecraftUsername);
+
+  // Link the account
+  db.linkMinecraftAccount(userId, minecraftUuid, minecraftUsername);
+
+  // Create wallet with starting balance
+  db.getOrCreateWallet(userId);
+
+  // Mark session as completed
+  db.completeLinkSession(sessionId, minecraftUsername, minecraftUuid);
+
+  // Record audit log
+  db.recordAuditLog('ACCOUNT_LINKED', discordUserId, minecraftUuid, null, null, 'SUCCESS',
+    JSON.stringify({ minecraftUsername, verification: 'MINECRAFT_PAYMENT' }));
+
+  log.info({
+    discordUserId,
+    minecraftUsername,
+    minecraftUuid,
+    sessionId
+  }, 'Account linked successfully');
+
+  return {
+    discordUserId,
+    minecraftUsername,
+    minecraftUuid
+  };
+}
+
+/**
+ * Generate a deterministic UUID for a Minecraft username
+ * This is a placeholder - in production you'd fetch the real UUID from Mojang API
+ * @param {string} username - Minecraft username
+ * @returns {string} - UUID string
+ */
+function generateMinecraftUuid(username) {
+  // Generate a deterministic UUID based on username
+  // This ensures the same username always gets the same UUID
+  const hash = crypto.createHash('sha256').update(username.toLowerCase()).digest('hex');
+  const uuid = [
+    hash.slice(0, 8),
+    hash.slice(8, 12),
+    '4' + hash.slice(13, 16), // Version 4
+    ((parseInt(hash.slice(16, 17), 16) & 0x3) | 0x8).toString(16) + hash.slice(17, 20),
+    hash.slice(20, 32)
+  ].join('-');
+  
+  return uuid;
+}
+
+/**
+ * Get link status for a Discord user
+ * @param {string} discordUserId - Discord user ID
+ * @returns {Object} - Link status
+ */
+export function getLinkStatus(discordUserId) {
+  const user = db.getUserByDiscordId(discordUserId);
+  
+  if (!user) {
+    return {
+      linked: false,
+      hasActiveSession: false
+    };
+  }
+
+  const mcAccount = db.getMinecraftAccount(user.id);
+  const activeSession = db.getActiveLinkSession(discordUserId);
+
+  return {
+    linked: !!mcAccount,
+    minecraftUsername: mcAccount?.minecraft_username || null,
+    minecraftUuid: mcAccount?.minecraft_uuid || null,
+    hasActiveSession: !!activeSession,
+    activeSession: activeSession ? {
+      sessionId: activeSession.session_id,
+      challengeAmount: activeSession.challenge_amount,
+      expiresAt: activeSession.expires_at
+    } : null
+  };
+}
+
+/**
+ * Unlink a Minecraft account
+ * @param {string} discordUserId - Discord user ID
  */
 export function unlinkAccount(discordUserId) {
   const user = db.getUserByDiscordId(discordUserId);
-  if (!user) throw new Error('NOT_LINKED: You do not have a linked account.');
+  
+  if (!user) {
+    throw new Error('Account not found');
+  }
 
   const mcAccount = db.getMinecraftAccount(user.id);
-  if (!mcAccount) throw new Error('NOT_LINKED: You do not have a linked Minecraft account.');
+  
+  if (!mcAccount) {
+    throw new Error('No Minecraft account linked');
+  }
 
   db.unlinkMinecraftAccount(user.id);
 
   db.recordAuditLog('ACCOUNT_UNLINKED', discordUserId, mcAccount.minecraft_uuid, null, null, 'SUCCESS',
     JSON.stringify({ minecraftUsername: mcAccount.minecraft_username }));
 
-  log.info({ discordUserId }, 'Account unlinked');
-  return mcAccount;
+  log.info({ discordUserId, minecraftUsername: mcAccount.minecraft_username }, 'Account unlinked');
 }
 
 /**
- * Clean up expired link requests.
+ * Expire old link sessions
+ * Should be called periodically
  */
-function cleanExpiredLinks() {
-  const now = Date.now();
-  for (const [code, request] of pendingLinks.entries()) {
-    if (now - request.timestamp > LINK_CODE_EXPIRY) {
-      pendingLinks.delete(code);
-      log.info({ code }, 'Expired link request removed');
-    }
+export function expireOldSessions() {
+  const expired = db.expireOldLinkSessions();
+  if (expired > 0) {
+    log.info({ count: expired }, 'Expired old link sessions');
   }
 }
 
-/**
- * Get the status of a link request.
- */
-export function getLinkStatus(discordUserId) {
-  for (const [code, request] of pendingLinks.entries()) {
-    if (request.discordUserId === discordUserId) {
-      const remaining = LINK_CODE_EXPIRY - (Date.now() - request.timestamp);
-      return {
-        pending: true,
-        code,
-        expiresInSeconds: Math.max(0, Math.floor(remaining / 1000)),
-      };
-    }
-  }
-  return { pending: false };
-}
-
-/**
- * Periodically clean expired links.
- */
-setInterval(cleanExpiredLinks, 60000);
-
-/**
- * For the actual /link command flow:
- * Since Mineflayer handles Microsoft auth internally (device code flow),
- * the bot admin needs to authenticate the MC bot account once.
- * 
- * For user linking, we use a simplified approach:
- * - The admin-configured MC bot account is already authenticated
- * - Users verify their identity by performing an in-game action
- *   (like sending a specific message or using a command)
- * - Or the admin manually verifies the link
- * 
- * This avoids storing any user credentials.
- */
-
-/**
- * Alternative: Admin-assisted linking
- * Admin verifies a user's Minecraft identity and links them.
- */
-export function adminLinkAccount(adminDiscordId, targetDiscordId, minecraftUuid, minecraftUsername) {
+// Set up payment monitor event listeners
+paymentMonitor.on('link-success', (data) => {
   try {
-    let user = db.getUserByDiscordId(targetDiscordId);
-    let userId;
-
-    if (!user) {
-      userId = db.createUser(targetDiscordId, null);
-    } else {
-      userId = user.id;
-    }
-
-    db.linkMinecraftAccount(userId, minecraftUuid, minecraftUsername);
-    db.getOrCreateWallet(userId);
-
-    db.recordAuditLog('ACCOUNT_LINKED', targetDiscordId, minecraftUuid, null, null, 'ADMIN_LINKED',
-      JSON.stringify({ admin: adminDiscordId, minecraftUsername }));
-
-    log.info({ adminDiscordId, targetDiscordId, minecraftUuid }, 'Admin-linked account');
-    return true;
+    const result = completeLinking(data.discordUserId, data.minecraftUsername, data.sessionId);
+    
+    // Emit completion event for Discord bot to handle
+    paymentMonitor.emit('link-completed', {
+      discordUserId: result.discordUserId,
+      minecraftUsername: result.minecraftUsername,
+      minecraftUuid: result.minecraftUuid
+    });
+    
   } catch (error) {
-    if (error.message === 'MINECRAFT_ALREADY_LINKED') {
-      throw new Error('That Minecraft account is already linked to another Discord user.');
-    }
-    if (error.message === 'USER_ALREADY_LINKED') {
-      throw new Error('That Discord user already has a linked Minecraft account.');
-    }
-    throw error;
+    log.error({ error, data }, 'Failed to complete linking');
+    paymentMonitor.emit('link-error', { error, data });
   }
-}
+});
+
+paymentMonitor.on('link-already-linked', (data) => {
+  paymentMonitor.emit('link-failed', {
+    discordUserId: data.discordUserId,
+    reason: 'already_linked',
+    existingAccount: data.existingAccount
+  });
+});
+
+paymentMonitor.on('minecraft-already-linked', (data) => {
+  paymentMonitor.emit('link-failed', {
+    minecraftUsername: data.minecraftUsername,
+    reason: 'minecraft_already_linked',
+    linkedToDiscord: data.linkedToDiscord
+  });
+});
+
+paymentMonitor.on('ambiguous-payment', (data) => {
+  if (data.type === 'link') {
+    paymentMonitor.emit('link-failed', {
+      reason: 'ambiguous_payment',
+      sessions: data.sessions
+    });
+  }
+});
+
+// Start session expiration checker (every minute)
+setInterval(expireOldSessions, 60 * 1000);

@@ -420,6 +420,62 @@ function runMigrations() {
           ('highlow', 1, 5),
           ('crash', 1, 5);
       `
+    },
+    {
+      name: '005_link_and_deposit_sessions',
+      sql: `
+        -- Link challenge sessions for Minecraft account verification
+        CREATE TABLE IF NOT EXISTS link_sessions (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          session_id TEXT NOT NULL UNIQUE,
+          discord_user_id TEXT NOT NULL,
+          challenge_amount INTEGER NOT NULL,
+          status TEXT NOT NULL DEFAULT 'PENDING' CHECK(status IN ('PENDING', 'COMPLETED', 'EXPIRED', 'CANCELLED')),
+          detected_sender TEXT,
+          detected_sender_uuid TEXT,
+          detected_at TEXT,
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          expires_at TEXT NOT NULL
+        );
+
+        -- Deposit challenge sessions
+        CREATE TABLE IF NOT EXISTS deposit_sessions (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          session_id TEXT NOT NULL UNIQUE,
+          discord_user_id TEXT NOT NULL,
+          user_id INTEGER,
+          requested_amount INTEGER NOT NULL,
+          challenge_amount INTEGER NOT NULL,
+          status TEXT NOT NULL DEFAULT 'PENDING' CHECK(status IN ('PENDING', 'CONFIRMED', 'EXPIRED', 'CANCELLED', 'FAILED')),
+          detected_sender TEXT,
+          detected_sender_uuid TEXT,
+          detected_at TEXT,
+          transaction_id TEXT,
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          expires_at TEXT NOT NULL
+        );
+
+        -- Processed payment log (prevents duplicate processing)
+        CREATE TABLE IF NOT EXISTS processed_payments (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          payment_hash TEXT NOT NULL UNIQUE,
+          sender TEXT NOT NULL,
+          sender_uuid TEXT,
+          recipient TEXT NOT NULL,
+          amount INTEGER NOT NULL,
+          detected_at TEXT NOT NULL DEFAULT (datetime('now')),
+          session_type TEXT,
+          session_id TEXT
+        );
+
+        -- Indexes
+        CREATE INDEX IF NOT EXISTS idx_link_sessions_discord ON link_sessions(discord_user_id);
+        CREATE INDEX IF NOT EXISTS idx_link_sessions_status ON link_sessions(status);
+        CREATE INDEX IF NOT EXISTS idx_link_sessions_expires ON link_sessions(expires_at);
+        CREATE INDEX IF NOT EXISTS idx_deposit_sessions_discord ON deposit_sessions(discord_user_id);
+        CREATE INDEX IF NOT EXISTS idx_deposit_sessions_status ON deposit_sessions(status);
+        CREATE INDEX IF NOT EXISTS idx_processed_payments_hash ON processed_payments(payment_hash);
+      `
     }
   ];
 
@@ -1677,4 +1733,246 @@ export function setRoleSyncConfig(guildId, roleId, requirementType, requirementV
  */
 export function removeRoleSyncConfig(guildId, roleId) {
   db.prepare('DELETE FROM role_sync_config WHERE guild_id = ? AND role_id = ?').run(guildId, roleId);
+}
+
+// ============================================================
+// LINK SESSIONS - Minecraft Account Verification
+// ============================================================
+
+/**
+ * Create a new link challenge session.
+ * Uses crypto.randomInt for secure random challenge amount (1-100).
+ * Handles concurrent sessions by checking for amount collisions.
+ */
+export function createLinkSession(discordUserId, challengeAmount) {
+  const sessionId = `LINK-${discordUserId}-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
+  const expiresAt = new Date(Date.now() + 5 * 60 * 1000).toISOString(); // 5 minutes
+
+  // Cancel any existing pending sessions for this user
+  db.prepare(`
+    UPDATE link_sessions SET status = 'CANCELLED'
+    WHERE discord_user_id = ? AND status = 'PENDING'
+  `).run(discordUserId);
+
+  db.prepare(`
+    INSERT INTO link_sessions (session_id, discord_user_id, challenge_amount, expires_at)
+    VALUES (?, ?, ?, ?)
+  `).run(sessionId, discordUserId, challengeAmount, expiresAt);
+
+  return { sessionId, challengeAmount, expiresAt };
+}
+
+/**
+ * Get active link session for a Discord user.
+ */
+export function getActiveLinkSession(discordUserId) {
+  return db.prepare(`
+    SELECT * FROM link_sessions
+    WHERE discord_user_id = ? AND status = 'PENDING' AND expires_at > datetime('now')
+    ORDER BY created_at DESC LIMIT 1
+  `).get(discordUserId);
+}
+
+/**
+ * Get link session by ID.
+ */
+export function getLinkSession(sessionId) {
+  return db.prepare('SELECT * FROM link_sessions WHERE session_id = ?').get(sessionId);
+}
+
+/**
+ * Find link sessions matching a payment (amount + not expired).
+ * Returns all matching sessions to detect ambiguity.
+ */
+export function findLinkSessionsByAmount(amount) {
+  return db.prepare(`
+    SELECT * FROM link_sessions
+    WHERE challenge_amount = ? AND status = 'PENDING' AND expires_at > datetime('now')
+  `).all(amount);
+}
+
+/**
+ * Complete a link session after successful payment verification.
+ */
+export function completeLinkSession(sessionId, senderName, senderUuid) {
+  const complete = db.transaction(() => {
+    const session = db.prepare('SELECT * FROM link_sessions WHERE session_id = ?').get(sessionId);
+    if (!session) throw new Error('SESSION_NOT_FOUND');
+    if (session.status !== 'PENDING') throw new Error('SESSION_NOT_PENDING');
+
+    db.prepare(`
+      UPDATE link_sessions SET
+        status = 'COMPLETED',
+        detected_sender = ?,
+        detected_sender_uuid = ?,
+        detected_at = datetime('now')
+      WHERE session_id = ?
+    `).run(senderName, senderUuid, sessionId);
+
+    return session;
+  });
+
+  return complete();
+}
+
+/**
+ * Cancel a link session.
+ */
+export function cancelLinkSession(sessionId) {
+  db.prepare("UPDATE link_sessions SET status = 'CANCELLED' WHERE session_id = ?").run(sessionId);
+}
+
+/**
+ * Expire old pending link sessions.
+ */
+export function expireOldLinkSessions() {
+  db.prepare(`
+    UPDATE link_sessions SET status = 'EXPIRED'
+    WHERE status = 'PENDING' AND expires_at <= datetime('now')
+  `).run();
+}
+
+// ============================================================
+// DEPOSIT SESSIONS
+// ============================================================
+
+/**
+ * Create a deposit session with a unique challenge amount.
+ */
+export function createDepositSession(discordUserId, userId, requestedAmount, challengeAmount) {
+  const sessionId = `DEP-${discordUserId}-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
+  const expiresAt = new Date(Date.now() + 30 * 60 * 1000).toISOString(); // 30 minutes
+
+  // Cancel any existing pending deposit sessions for this user
+  db.prepare(`
+    UPDATE deposit_sessions SET status = 'CANCELLED'
+    WHERE discord_user_id = ? AND status = 'PENDING'
+  `).run(discordUserId);
+
+  db.prepare(`
+    INSERT INTO deposit_sessions (session_id, discord_user_id, user_id, requested_amount, challenge_amount, expires_at)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `).run(sessionId, discordUserId, userId, requestedAmount, challengeAmount, expiresAt);
+
+  return { sessionId, challengeAmount, expiresAt };
+}
+
+/**
+ * Get active deposit session for a Discord user.
+ */
+export function getActiveDepositSession(discordUserId) {
+  return db.prepare(`
+    SELECT * FROM deposit_sessions
+    WHERE discord_user_id = ? AND status = 'PENDING' AND expires_at > datetime('now')
+    ORDER BY created_at DESC LIMIT 1
+  `).get(discordUserId);
+}
+
+/**
+ * Find deposit sessions matching a payment.
+ */
+export function findDepositSessionsByAmount(amount) {
+  return db.prepare(`
+    SELECT * FROM deposit_sessions
+    WHERE challenge_amount = ? AND status = 'PENDING' AND expires_at > datetime('now')
+  `).all(amount);
+}
+
+/**
+ * Complete a deposit session and credit the wallet.
+ */
+export function completeDepositSession(sessionId, senderName, senderUuid) {
+  const complete = db.transaction(() => {
+    const session = db.prepare('SELECT * FROM deposit_sessions WHERE session_id = ?').get(sessionId);
+    if (!session) throw new Error('SESSION_NOT_FOUND');
+    if (session.status !== 'PENDING') throw new Error('SESSION_NOT_PENDING');
+    if (!session.user_id) throw new Error('USER_NOT_LINKED');
+
+    // Update session status
+    db.prepare(`
+      UPDATE deposit_sessions SET
+        status = 'CONFIRMED',
+        detected_sender = ?,
+        detected_sender_uuid = ?,
+        detected_at = datetime('now')
+      WHERE session_id = ?
+    `).run(senderName, senderUuid, sessionId);
+
+    // Credit the wallet
+    const wallet = db.prepare('SELECT * FROM wallets WHERE user_id = ?').get(session.user_id);
+    if (!wallet) throw new Error('WALLET_NOT_FOUND');
+
+    const txnId = `DEP-${sessionId}-${Date.now()}`;
+    const newBalance = wallet.balance + session.requested_amount;
+
+    db.prepare(`
+      INSERT INTO wallet_transactions (transaction_id, user_id, wallet_id, type, amount, balance_before, balance_after, status, reference_type, reference_id, reason)
+      VALUES (?, ?, ?, 'DEPOSIT', ?, ?, ?, 'COMPLETED', 'DEPOSIT', ?, 'Deposit confirmed via Minecraft payment')
+    `).run(txnId, session.user_id, wallet.id, session.requested_amount, wallet.balance, newBalance, sessionId);
+
+    db.prepare('UPDATE wallets SET balance = ?, total_deposited = total_deposited + ?, updated_at = datetime(\'now\') WHERE id = ?')
+      .run(newBalance, session.requested_amount, wallet.id);
+
+    // Update session with transaction ID
+    db.prepare('UPDATE deposit_sessions SET transaction_id = ? WHERE session_id = ?').run(txnId, sessionId);
+
+    return { session, transactionId: txnId, newBalance };
+  });
+
+  return complete();
+}
+
+/**
+ * Cancel a deposit session.
+ */
+export function cancelDepositSession(sessionId) {
+  db.prepare("UPDATE deposit_sessions SET status = 'CANCELLED' WHERE session_id = ?").run(sessionId);
+}
+
+/**
+ * Expire old pending deposit sessions.
+ */
+export function expireOldDepositSessions() {
+  db.prepare(`
+    UPDATE deposit_sessions SET status = 'EXPIRED'
+    WHERE status = 'PENDING' AND expires_at <= datetime('now')
+  `).run();
+}
+
+// ============================================================
+// PROCESSED PAYMENTS - Duplicate Prevention
+// ============================================================
+
+/**
+ * Generate a unique hash for a payment event.
+ */
+export function generatePaymentHash(sender, recipient, amount, timestamp) {
+  const data = `${sender}:${recipient}:${amount}:${timestamp}`;
+  return crypto.createHash('sha256').update(data).digest('hex');
+}
+
+/**
+ * Check if a payment has already been processed.
+ */
+export function isPaymentProcessed(paymentHash) {
+  return db.prepare('SELECT 1 FROM processed_payments WHERE payment_hash = ?').get(paymentHash);
+}
+
+/**
+ * Record a processed payment.
+ */
+export function recordProcessedPayment(paymentHash, sender, senderUuid, recipient, amount, sessionType, sessionId) {
+  db.prepare(`
+    INSERT INTO processed_payments (payment_hash, sender, sender_uuid, recipient, amount, session_type, session_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `).run(paymentHash, sender, senderUuid, recipient, amount, sessionType, sessionId);
+}
+
+/**
+ * Get recent processed payments (for debugging).
+ */
+export function getRecentProcessedPayments(limit = 50) {
+  return db.prepare(`
+    SELECT * FROM processed_payments ORDER BY detected_at DESC LIMIT ?
+  `).all(limit);
 }

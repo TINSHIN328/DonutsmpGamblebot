@@ -7,6 +7,7 @@ import mineflayer from 'mineflayer';
 import config from './config.js';
 import { createLogger } from './logger.js';
 import * as db from './database.js';
+import { paymentMonitor } from './minecraft/payment-monitor.js';
 
 const log = createLogger('minecraft');
 
@@ -60,6 +61,9 @@ function registerBotEvents() {
     reconnectAttempts = 0;
     log.info('Minecraft bot spawned successfully');
     db.recordAuditLog('BOT_CONNECTED', null, null, null, null, 'SUCCESS', 'Minecraft bot connected');
+    
+    // Start payment monitor with bot's username
+    paymentMonitor.start(config.MC_USERNAME);
   });
 
   bot.on('login', () => {
@@ -92,11 +96,17 @@ function registerBotEvents() {
   bot.on('chat', (username, message) => {
     // Handle chat messages for transaction verification
     handleChatMessage(username, message);
+    
+    // Forward to payment monitor
+    paymentMonitor.processMessage(message);
   });
 
   bot.on('messagestr', (message) => {
     // Handle system messages (like payment confirmations)
     handleSystemMessage(message);
+    
+    // Also forward system messages to payment monitor
+    paymentMonitor.processMessage(message);
   });
 }
 
@@ -235,6 +245,9 @@ export async function disconnectBot() {
     clearTimeout(reconnectTimer);
     reconnectTimer = null;
   }
+
+  // Stop payment monitor
+  paymentMonitor.stop();
 
   if (bot) {
     try {

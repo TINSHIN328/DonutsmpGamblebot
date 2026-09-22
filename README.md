@@ -152,17 +152,54 @@ https://discord.com/api/oauth2/authorize?client_id=YOUR_CLIENT_ID&permissions=27
 
 ---
 
-## 🎮 Microsoft Authentication Setup
+## 🔗 Account Linking (Payment Verification)
 
-The Minecraft bot uses **Microsoft authentication** via Mineflayer's built-in device code flow.
+The bot uses a **Minecraft payment verification** system to link accounts. No passwords are ever collected.
 
-**Important:** The bot NEVER stores your Microsoft password. Authentication happens through Microsoft's secure device code flow.
+### How It Works
 
-1. Set `MC_USERNAME` to your Microsoft account email
-2. Set `MC_AUTH=microsoft`
-3. On first connection, Mineflayer will display a URL and code in the console
-4. Open the URL in a browser and enter the code to authenticate
-5. The bot will cache the authentication tokens securely
+1. User runs `/link` in Discord
+2. Bot generates a **random challenge amount** (1-100) using `crypto.randomInt()`
+3. User joins DonutSMP in Minecraft and sends: `/pay <BotUsername> <challenge_amount>`
+4. The Minecraft bot detects the payment automatically
+5. If the amount matches an active challenge, the account is linked
+
+### Security
+
+- Challenge amounts are **cryptographically random** (never `Math.random()`)
+- Each session has a unique ID, expiration, and amount
+- **Duplicate payments are prevented** via SHA-256 hashing
+- **Ambiguous payments** (same amount from multiple users) are safely rejected
+- The verification payment is **NOT** credited to the wallet
+- No Microsoft passwords are ever stored or transmitted
+
+### Example Flow
+
+```
+User: /link
+Bot: 🔗 Send /pay ZpSniper 73 (expires in 5 min)
+User: /pay ZpSniper 73 (in Minecraft)
+Bot: ✅ Account linked! Minecraft: ZpSniper123
+```
+
+### Concurrent Users
+
+Multiple users can link simultaneously. The system:
+- Generates unique challenge amounts when possible
+- Detects and rejects ambiguous payments
+- Never links the wrong account
+
+## 💰 Deposit System
+
+Deposits use a similar challenge-based verification:
+
+1. User runs `/deposit 1000000`
+2. Bot generates a unique challenge amount (different from deposit amount)
+3. User sends the **challenge amount** in Minecraft
+4. Bot detects payment and credits the **requested deposit amount** to wallet
+5. The challenge amount identifies the deposit session
+
+**Important:** The challenge amount is NOT the deposit amount. It's used to uniquely identify your deposit session.
 
 ---
 
