@@ -152,17 +152,54 @@ https://discord.com/api/oauth2/authorize?client_id=YOUR_CLIENT_ID&permissions=27
 
 ---
 
-## 🎮 Microsoft Authentication Setup
+## 🔗 Account Linking (Payment Verification)
 
-The Minecraft bot uses **Microsoft authentication** via Mineflayer's built-in device code flow.
+The bot uses a **Minecraft payment verification** system to link accounts. No passwords are ever collected.
 
-**Important:** The bot NEVER stores your Microsoft password. Authentication happens through Microsoft's secure device code flow.
+### How It Works
 
-1. Set `MC_USERNAME` to your Microsoft account email
-2. Set `MC_AUTH=microsoft`
-3. On first connection, Mineflayer will display a URL and code in the console
-4. Open the URL in a browser and enter the code to authenticate
-5. The bot will cache the authentication tokens securely
+1. User runs `/link` in Discord
+2. Bot generates a **random challenge amount** (1-100) using `crypto.randomInt()`
+3. User joins DonutSMP in Minecraft and sends: `/pay <BotUsername> <challenge_amount>`
+4. The Minecraft bot detects the payment automatically
+5. If the amount matches an active challenge, the account is linked
+
+### Security
+
+- Challenge amounts are **cryptographically random** (never `Math.random()`)
+- Each session has a unique ID, expiration, and amount
+- **Duplicate payments are prevented** via SHA-256 hashing
+- **Ambiguous payments** (same amount from multiple users) are safely rejected
+- The verification payment is **NOT** credited to the wallet
+- No Microsoft passwords are ever stored or transmitted
+
+### Example Flow
+
+```
+User: /link
+Bot: 🔗 Send /pay ZpSniper 73 (expires in 5 min)
+User: /pay ZpSniper 73 (in Minecraft)
+Bot: ✅ Account linked! Minecraft: ZpSniper123
+```
+
+### Concurrent Users
+
+Multiple users can link simultaneously. The system:
+- Generates unique challenge amounts when possible
+- Detects and rejects ambiguous payments
+- Never links the wrong account
+
+## 💰 Deposit System
+
+Deposits use a similar challenge-based verification:
+
+1. User runs `/deposit 1000000`
+2. Bot generates a unique challenge amount (different from deposit amount)
+3. User sends the **challenge amount** in Minecraft
+4. Bot detects payment and credits the **requested deposit amount** to wallet
+5. The challenge amount identifies the deposit session
+
+**Important:** The challenge amount is NOT the deposit amount. It's used to uniquely identify your deposit session.
 
 ---
 
@@ -199,22 +236,61 @@ cp data/database.sqlite data/backups/manual-$(date +%Y%m%d).sqlite
 
 ### User Commands
 
+#### 💰 Economy
+| Command | Description |
+|---------|-------------|
+| `/balance` | View your wallet balance |
+| `/wallet` | View detailed wallet stats |
+| `/deposit <amount>` | Deposit MC money to gambling wallet |
+| `/withdraw <amount>` | Withdraw to your MC account |
+| `/pay <user> <amount>` | Send money to another player |
+| `/history` | View transaction/game history |
+| `/info` | View economy rules and info |
+
+#### 🎰 Games
+| Command | Description |
+|---------|-------------|
+| `/coinflip <bet>` | Flip a coin (2x payout) |
+| `/blackjack <bet>` | Play Blackjack with Hit/Stand/Double |
+| `/roulette <bet> <type>` | Play roulette (2x-36x) |
+| `/slots <bet>` | Slot machine with symbol matching |
+| `/dice <bet> <number>` | Pick a number 1-6 (6x payout) |
+| `/chicken <bet>` | Cross the road, cash out before hit |
+| `/keno <bet> <numbers>` | Pick up to 10 numbers |
+| `/limbo <bet> <target>` | Set target multiplier |
+| `/mines <bet> <mines>` | Reveal tiles, avoid mines |
+| `/tower <bet>` | Climb tower floor by floor |
+
+#### 👤 Account
 | Command | Description |
 |---------|-------------|
 | `/link` | Link your Discord to Minecraft account |
 | `/unlink` | Unlink your account |
 | `/profile` | View your player profile |
-| `/wallet` | View your wallet balance and stats |
-| `/deposit <amount>` | Deposit MC money to gambling wallet |
-| `/withdraw <amount>` | Withdraw to your MC account |
-| `/history` | View transaction/game history |
-| `/coinflip <amount>` | Flip a coin (2x payout) |
-| `/dice <amount> <number>` | Roll dice (6x payout) |
-| `/roulette <amount> <bet>` | Play roulette |
-| `/highlow <amount> <choice>` | High/Low game |
-| `/crash <amount> <cashout>` | Crash game |
+| `/account` | View your account info |
+
+#### 🏆 Rewards
+| Command | Description |
+|---------|-------------|
+| `/baltop` | View richest players leaderboard |
+| `/games` | View all available games |
+| `/redeem <code>` | Redeem a promo code |
+| `/rakeback` | View and claim rakeback |
+| `/invites` | View your referral invites |
+| `/advertisement` | View ad reward info |
+
+#### 🔐 Fairness
+| Command | Description |
+|---------|-------------|
+| `/provablyfair` | Learn about provably fair system |
 | `/verify <game_id>` | Verify game fairness |
+
+#### ⚙️ Utility
+| Command | Description |
+|---------|-------------|
 | `/status` | View bot status |
+| `/help` | View all commands |
+| `/refreshroles` | Sync roles based on stats |
 
 ### Admin Commands
 
@@ -284,13 +360,20 @@ All games use **provably fair** randomness:
 
 ### Available Games
 
-| Game | Payout | Description |
-|------|--------|-------------|
-| Coinflip | 2x | Pick heads or tails |
-| Dice | 6x | Pick a number 1-6 |
-| Roulette | 2x-36x | Bet on color/number |
-| High/Low | 2x/10x | Guess high or low |
-| Crash | 1.01x-100x | Cash out before crash |
+| Game | Payout | Interactive | Description |
+|------|--------|-------------|-------------|
+| 🪙 Coinflip | 2x | No | Pick heads or tails |
+| ♠️ Blackjack | 2x-2.5x | Yes | Hit/Stand/Double against dealer |
+| 🎡 Roulette | 2x-36x | No | Bet on color/number/odd/even |
+| 🎰 Slots | 1.5x-50x | No | Match 3 symbols |
+| 🎲 Dice | 6x | No | Pick a number 1-6 |
+| 🐔 Chicken | 1.4x/row | Yes | Cross road, cash out before hit |
+| 🎯 Keno | 1x-10000x | No | Pick up to 10 numbers |
+| 🚀 Limbo | 1.01x-1000x | No | Set target multiplier |
+| 💣 Mines | Dynamic | Yes | Reveal tiles, avoid mines, cash out |
+| 🏗️ Tower | Dynamic | Yes | Climb floors, cash out safely |
+| 📊 High/Low | 2x/10x | No | Guess high or low |
+| 📈 Crash | 1.01x-100x | No | Cash out before crash |
 
 ---
 

@@ -7,6 +7,7 @@ import {
   SlashCommandBuilder, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle,
   PermissionFlagsBits, ChannelType
 } from 'discord.js';
+import crypto from 'crypto';
 import config from './config.js';
 import { createLogger, logSecurityEvent } from './logger.js';
 import * as db from './database.js';
@@ -16,10 +17,118 @@ import * as auth from './auth.js';
 import * as minecraft from './minecraft.js';
 import * as ui from './ui.js';
 import { isAdmin, validateAmount, checkCommandRateLimit, checkWithdrawCooldown, updateWithdrawTracking, checkDailyWithdrawal } from './security.js';
+import { getExtendedCommands, handleExtendedCommand, handleGameButton } from './commands.js';
+import { paymentMonitor } from './minecraft/payment-monitor.js';
 
 const log = createLogger('events');
 
 let client = null;
+
+// Track active link interactions for updates
+const linkInteractions = new Map();
+
+// Track active deposit interactions for updates
+const depositInteractions = new Map();
+
+// Set up payment monitor event listeners for Discord notifications
+paymentMonitor.on('link-completed', async (data) => {
+  const interaction = linkInteractions.get(data.discordUserId);
+  if (!interaction) return;
+
+  try {
+    const successEmbed = new EmbedBuilder()
+      .setTitle('✅ ACCOUNT LINKED SUCCESSFULLY')
+      .setColor(0x57F287)
+      .setDescription(
+        `**Minecraft:** \`${data.minecraftUsername}\`\n` +
+        `**Discord:** <@${data.discordUserId}>\n` +
+        `**Verification:** Minecraft payment\n\n` +
+        `You can now use:\n` +
+        `• \`/wallet\` - View your balance\n` +
+        `• \`/coinflip\` - Play games\n` +
+        `• \`/deposit\` - Add funds\n` +
+        `• \`/withdraw\` - Withdraw funds`
+      )
+      .setTimestamp();
+
+    await interaction.editReply({ embeds: [successEmbed], components: [] });
+    linkInteractions.delete(data.discordUserId);
+  } catch (error) {
+    log.error({ error, discordUserId: data.discordUserId }, 'Failed to update link interaction');
+  }
+});
+
+paymentMonitor.on('link-failed', async (data) => {
+  const interaction = linkInteractions.get(data.discordUserId);
+  if (!interaction) return;
+
+  try {
+    let message = '❌ Linking failed: ';
+    
+    switch (data.reason) {
+      case 'already_linked':
+        message += `You already have a linked Minecraft account (\`${data.existingAccount}\`). Use \`/unlink\` first.`;
+        break;
+      case 'minecraft_already_linked':
+        message += `This Minecraft account is already linked to another Discord user.`;
+        break;
+      case 'ambiguous_payment':
+        message += `Multiple users are linking with the same amount. Please try again with \`/link\` to get a new code.`;
+        break;
+      default:
+        message += 'Unknown error. Please try again.';
+    }
+
+    await interaction.editReply({ content: message, embeds: [], components: [] });
+    linkInteractions.delete(data.discordUserId);
+  } catch (error) {
+    log.error({ error }, 'Failed to update link failure');
+  }
+});
+
+// Deposit completion listener
+paymentMonitor.on('deposit-success', async (data) => {
+  const depositData = depositInteractions.get(data.discordUserId);
+  if (!depositData) return;
+
+  const { interaction, amount } = depositData;
+
+  try {
+    const successEmbed = new EmbedBuilder()
+      .setTitle('✅ DEPOSIT CONFIRMED')
+      .setColor(0x57F287)
+      .setDescription(
+        `Your deposit has been confirmed!\n\n` +
+        `**Amount:** ${economy.formatMoney(amount)}\n` +
+        `**New Balance:** ${economy.formatMoney(data.newBalance)}\n\n` +
+        `The funds are now available in your gambling wallet.`
+      )
+      .setTimestamp();
+
+    await interaction.editReply({ embeds: [successEmbed] });
+    depositInteractions.delete(data.discordUserId);
+  } catch (error) {
+    log.error({ error, discordUserId: data.discordUserId }, 'Failed to update deposit interaction');
+  }
+});
+
+paymentMonitor.on('deposit-error', async (data) => {
+  const depositData = depositInteractions.get(data.session?.discord_user_id);
+  if (!depositData) return;
+
+  try {
+    const errorEmbed = new EmbedBuilder()
+      .setTitle('❌ DEPOSIT FAILED')
+      .setColor(0xED4245)
+      .setDescription(`Your deposit could not be processed: ${data.error?.message || 'Unknown error'}`)
+      .setTimestamp();
+
+    await depositData.interaction.editReply({ embeds: [errorEmbed] });
+    depositInteractions.delete(data.session?.discord_user_id);
+  } catch (error) {
+    log.error({ error }, 'Failed to update deposit error');
+  }
+});
 
 /**
  * Get a channel by ID.
@@ -33,7 +142,8 @@ export function getChannel(channelId) {
  * Define all slash commands.
  */
 function getCommandDefinitions() {
-  return [
+  // Combine base commands with extended commands
+  const baseCommands = [
     // === Account Commands ===
     new SlashCommandBuilder()
       .setName('link')
@@ -201,6 +311,10 @@ function getCommandDefinitions() {
       .addStringOption(opt => opt.setName('transaction_id').setDescription('Transaction ID').setRequired(true))
       .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
   ];
+
+  // Combine with extended commands
+  const extendedCommands = getExtendedCommands();
+  return [...baseCommands, ...extendedCommands];
 }
 
 /**
@@ -315,6 +429,31 @@ async function handleCommand(interaction) {
     case 'refund': await handleRefund(interaction); break;
     case 'transaction': await handleTransaction(interaction); break;
 
+    // Extended commands (delegated to commands.js)
+    case 'balance':
+    case 'pay':
+    case 'baltop':
+    case 'info':
+    case 'blackjack':
+    case 'slots':
+    case 'chicken':
+    case 'keno':
+    case 'limbo':
+    case 'mines':
+    case 'tower':
+    case 'redeem':
+    case 'rakeback':
+    case 'invites':
+    case 'advertisement':
+    case 'games':
+    case 'provablyfair':
+    case 'help':
+    case 'refreshroles':
+    case 'giveaway':
+    case 'forcewithdraw':
+      await handleExtendedCommand(interaction);
+      break;
+
     default:
       await interaction.reply({ content: '❓ Unknown command.', ephemeral: true });
   }
@@ -328,33 +467,69 @@ async function handleLink(interaction) {
   await interaction.deferReply({ ephemeral: true });
 
   try {
-    const { code, existing } = auth.createLinkRequest(interaction.user.id);
-
-    if (existing) {
-      await interaction.editReply({
-        content: `⏳ You already have a pending link request.\nCode: \`${code}\`\nPlease wait for an admin to verify your Minecraft account, or wait for the code to expire.`,
-      });
-      return;
-    }
-
+    // Create a new link session with payment challenge
+    const session = auth.createLinkSession(interaction.user.id);
+    
+    const expiresTimestamp = Math.floor(new Date(session.expiresAt).getTime() / 1000);
+    
     const embed = new EmbedBuilder()
-      .setTitle('🔗 Account Linking')
+      .setTitle('🔗 LINK YOUR MINECRAFT ACCOUNT')
       .setColor(0x5865F2)
       .setDescription(
-        `To link your Minecraft account, an administrator needs to verify your identity.\n\n` +
-        `**Your Link Code:** \`${code}\`\n\n` +
-        `Please share this code with an administrator along with your Minecraft username.\n\n` +
-        `⚠️ This code expires in 5 minutes.`
+        `**Step 1:** Login to Minecraft and join **DonutSMP**\n\n` +
+        `**Step 2:** Send the following payment from your Minecraft account:\n\n` +
+        `> \`/pay ${session.botUsername} ${session.challengeAmount}\`\n\n` +
+        `⚠️ You must send **EXACTLY $${session.challengeAmount}**\n` +
+        `⚠️ This is an **ACCOUNT VERIFICATION PAYMENT** (not a deposit)\n` +
+        `⚠️ Do NOT send any other amount\n` +
+        `⚠️ This code expires <t:${expiresTimestamp}:R>\n\n` +
+        `The bot will automatically detect your payment and link your account.`
       )
+      .addFields(
+        { name: '📋 Session ID', value: `\`${session.sessionId.slice(0, 16)}...\``, inline: false },
+        { name: '💰 Challenge Amount', value: `$${session.challengeAmount}`, inline: true },
+        { name: '⏱️ Expires', value: `<t:${expiresTimestamp}:R>`, inline: true }
+      )
+      .setFooter({ text: 'This payment verifies ownership - it will not be added to your wallet' })
       .setTimestamp();
 
-    await interaction.editReply({ embeds: [embed] });
+    const buttons = new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`link_refresh_${interaction.user.id}`)
+        .setLabel('🔄 Generate New Code')
+        .setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder()
+        .setCustomId(`link_cancel_${interaction.user.id}`)
+        .setLabel('❌ Cancel')
+        .setStyle(ButtonStyle.Danger)
+    );
+
+    // Store the interaction for later updates
+    linkInteractions.set(interaction.user.id, interaction);
+
+    await interaction.editReply({ embeds: [embed], components: [buttons] });
+
+    // Set up timeout to update the message when expired
+    const timeoutMs = new Date(session.expiresAt).getTime() - Date.now();
+    setTimeout(async () => {
+      try {
+        const status = auth.getLinkStatus(interaction.user.id);
+        if (!status.linked && linkInteractions.has(interaction.user.id)) {
+          const expiredEmbed = new EmbedBuilder()
+            .setTitle('⏰ Link Session Expired')
+            .setColor(0xED4245)
+            .setDescription('Your link session has expired. Run `/link` again to generate a new code.');
+          
+          await interaction.editReply({ embeds: [expiredEmbed], components: [] });
+          linkInteractions.delete(interaction.user.id);
+        }
+      } catch (error) {
+        // Ignore errors (interaction may have been deleted)
+      }
+    }, timeoutMs);
+
   } catch (error) {
-    if (error.message.includes('ALREADY_LINKED')) {
-      await interaction.editReply({ content: `❌ ${error.message}` });
-    } else {
-      throw error;
-    }
+    await interaction.editReply({ content: `❌ ${error.message}` });
   }
 }
 
@@ -415,22 +590,72 @@ async function handleDeposit(interaction) {
     return;
   }
 
-  const { depositId } = db.processDeposit(user.id, amount);
+  // Generate a unique challenge amount for this deposit
+  // The challenge amount is different from the requested amount
+  // It's used to uniquely identify this deposit session
+  const challengeAmount = crypto.randomInt(1000, 10000); // Random 4-digit number
+
+  // Check for collisions
+  const existingSessions = db.findDepositSessionsByAmount(challengeAmount);
+  let finalChallengeAmount = challengeAmount;
+  let attempts = 0;
+  while (existingSessions.length > 0 && attempts < 10) {
+    finalChallengeAmount = crypto.randomInt(1000, 10000);
+    const collisions = db.findDepositSessionsByAmount(finalChallengeAmount);
+    if (collisions.length === 0) break;
+    attempts++;
+  }
+
+  // Create deposit session
+  const session = db.createDepositSession(interaction.user.id, user.id, amount, finalChallengeAmount);
+  const expiresTimestamp = Math.floor(new Date(session.expiresAt).getTime() / 1000);
+
+  const mcBotUsername = paymentMonitor.botUsername || config.MC_USERNAME;
 
   const embed = new EmbedBuilder()
-    .setTitle('📥 Deposit Created')
+    .setTitle('📥 DEPOSIT INSTRUCTIONS')
     .setColor(0x3498DB)
     .setDescription(
-      `Your deposit of **${economy.formatMoney(amount)}** has been created.\n\n` +
-      `**Deposit ID:** \`${depositId.slice(0, 12)}...\`\n` +
-      `**Status:** ⏳ PENDING\n\n` +
-      `To complete this deposit, please transfer **${economy.formatMoney(amount)}** in-game to the bot's account.\n` +
-      `The deposit will be confirmed once the in-game transaction is verified.\n\n` +
-      `⚠️ This deposit expires in 30 minutes.`
+      `To deposit **${economy.formatMoney(amount)}** into your wallet:\n\n` +
+      `**Send this exact payment in Minecraft:**\n\n` +
+      `> \`/pay ${mcBotUsername} ${finalChallengeAmount}\`\n\n` +
+      `⚠️ You must send **EXACTLY $${finalChallengeAmount}**\n` +
+      `⚠️ Do NOT send the deposit amount directly\n` +
+      `⚠️ The challenge amount ($${finalChallengeAmount}) identifies your deposit\n` +
+      `⚠️ This deposit expires <t:${expiresTimestamp}:R>\n\n` +
+      `Once the payment is detected, **${economy.formatMoney(amount)}** will be added to your wallet.`
     )
+    .addFields(
+      { name: '💰 Deposit Amount', value: economy.formatMoney(amount), inline: true },
+      { name: '🔑 Challenge Amount', value: `$${finalChallengeAmount}`, inline: true },
+      { name: '⏱️ Expires', value: `<t:${expiresTimestamp}:R>`, inline: true },
+      { name: '📋 Session ID', value: `\`${session.sessionId.slice(0, 16)}...\``, inline: false }
+    )
+    .setFooter({ text: 'The challenge amount is NOT your deposit amount - send exactly the challenge amount' })
     .setTimestamp();
 
+  // Store interaction for deposit completion notification
+  depositInteractions.set(interaction.user.id, { interaction, amount });
+
   await interaction.editReply({ embeds: [embed] });
+
+  // Set up timeout
+  const timeoutMs = new Date(session.expiresAt).getTime() - Date.now();
+  setTimeout(async () => {
+    try {
+      if (depositInteractions.has(interaction.user.id)) {
+        const expiredEmbed = new EmbedBuilder()
+          .setTitle('⏰ Deposit Expired')
+          .setColor(0xED4245)
+          .setDescription('Your deposit session has expired. Run `/deposit` again to create a new one.');
+        
+        await interaction.editReply({ embeds: [expiredEmbed] });
+        depositInteractions.delete(interaction.user.id);
+      }
+    } catch (error) {
+      // Ignore
+    }
+  }, timeoutMs);
 }
 
 async function handleWithdraw(interaction) {
@@ -998,9 +1223,90 @@ async function handleTransaction(interaction) {
 async function handleButton(interaction) {
   const customId = interaction.customId;
 
+  // Handle link buttons
+  if (customId.startsWith('link_refresh_')) {
+    const discordUserId = customId.replace('link_refresh_', '');
+    if (discordUserId !== interaction.user.id) {
+      await interaction.reply({ content: '❌ This is not your link session.', ephemeral: true });
+      return;
+    }
+
+    await interaction.deferUpdate();
+    
+    try {
+      // Cancel old session and create new one
+      auth.cancelLinkSession(discordUserId);
+      const session = auth.createLinkSession(discordUserId);
+      
+      const expiresTimestamp = Math.floor(new Date(session.expiresAt).getTime() / 1000);
+      
+      const embed = new EmbedBuilder()
+        .setTitle('🔗 LINK YOUR MINECRAFT ACCOUNT')
+        .setColor(0x5865F2)
+        .setDescription(
+          `**Step 1:** Login to Minecraft and join **DonutSMP**\n\n` +
+          `**Step 2:** Send the following payment from your Minecraft account:\n\n` +
+          `> \`/pay ${session.botUsername} ${session.challengeAmount}\`\n\n` +
+          `⚠️ You must send **EXACTLY $${session.challengeAmount}**\n` +
+          `⚠️ This is an **ACCOUNT VERIFICATION PAYMENT** (not a deposit)\n` +
+          `⚠️ Do NOT send any other amount\n` +
+          `⚠️ This code expires <t:${expiresTimestamp}:R>\n\n` +
+          `The bot will automatically detect your payment and link your account.`
+        )
+        .addFields(
+          { name: '📋 Session ID', value: `\`${session.sessionId.slice(0, 16)}...\``, inline: false },
+          { name: '💰 Challenge Amount', value: `$${session.challengeAmount}`, inline: true },
+          { name: '⏱️ Expires', value: `<t:${expiresTimestamp}:R>`, inline: true }
+        )
+        .setFooter({ text: 'This payment verifies ownership - it will not be added to your wallet' })
+        .setTimestamp();
+
+      const buttons = new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setCustomId(`link_refresh_${discordUserId}`)
+          .setLabel('🔄 Generate New Code')
+          .setStyle(ButtonStyle.Secondary),
+        new ButtonBuilder()
+          .setCustomId(`link_cancel_${discordUserId}`)
+          .setLabel('❌ Cancel')
+          .setStyle(ButtonStyle.Danger)
+      );
+
+      await interaction.editReply({ embeds: [embed], components: [buttons] });
+    } catch (error) {
+      await interaction.editReply({ content: `❌ ${error.message}`, embeds: [], components: [] });
+    }
+    return;
+  }
+
+  if (customId.startsWith('link_cancel_')) {
+    const discordUserId = customId.replace('link_cancel_', '');
+    if (discordUserId !== interaction.user.id) {
+      await interaction.reply({ content: '❌ This is not your link session.', ephemeral: true });
+      return;
+    }
+
+    auth.cancelLinkSession(discordUserId);
+    linkInteractions.delete(discordUserId);
+
+    const cancelEmbed = new EmbedBuilder()
+      .setTitle('❌ Link Cancelled')
+      .setColor(0xED4245)
+      .setDescription('Your link session has been cancelled. Run `/link` again when ready.');
+
+    await interaction.update({ embeds: [cancelEmbed], components: [] });
+    return;
+  }
+
+  // Handle game buttons (blackjack, mines, tower, chicken, etc.)
+  const gamePrefixes = ['bj_', 'mines_', 'tower_', 'chicken_', 'rakeback_', 'giveaway_'];
+  if (gamePrefixes.some(prefix => customId.startsWith(prefix))) {
+    await handleGameButton(interaction);
+    return;
+  }
+
   // Handle pagination buttons
   if (customId.includes('_prev') || customId.includes('_next') || customId.includes('_first') || customId.includes('_last')) {
-    // Pagination logic would go here
     await interaction.reply({ content: '⏳ Pagination is handled via message updates.', ephemeral: true });
     return;
   }
