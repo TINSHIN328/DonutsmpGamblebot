@@ -340,19 +340,128 @@ export function initDiscordClient() {
 
 /**
  * Register slash commands with Discord API.
+ * Supports both guild-specific and global registration.
  */
 export async function registerCommands() {
   const rest = new REST({ version: '10' }).setToken(config.DISCORD_TOKEN);
-  const commands = getCommandDefinitions().map(cmd => cmd.toJSON());
+  const commandDefs = getCommandDefinitions();
+  
+  // Validate commands before registration
+  const validation = validateCommands(commandDefs);
+  if (!validation.valid) {
+    console.error('\n❌ COMMAND VALIDATION FAILED');
+    console.error('-----------------------------------');
+    for (const error of validation.errors) {
+      console.error(`  • ${error}`);
+    }
+    console.error('-----------------------------------\n');
+    throw new Error('Command validation failed');
+  }
+  
+  const commands = commandDefs.map(cmd => cmd.toJSON());
+  
+  console.log('\n📋 COMMAND REGISTRATION');
+  console.log('-----------------------------------');
+  console.log(`Total commands to register: ${commands.length}`);
+  
+  // Determine registration route
+  let route;
+  let registrationType;
+  
+  if (config.DISCORD_GUILD_ID) {
+    // Guild-specific registration (instant availability)
+    route = Routes.applicationGuildCommands(config.DISCORD_CLIENT_ID, config.DISCORD_GUILD_ID);
+    registrationType = 'guild';
+    console.log(`Registration type: Guild-specific`);
+    console.log(`Guild ID: ${config.DISCORD_GUILD_ID}`);
+  } else {
+    // Global registration (takes up to 1 hour)
+    route = Routes.applicationCommands(config.DISCORD_CLIENT_ID);
+    registrationType = 'global';
+    console.log(`Registration type: Global`);
+    console.log(`⚠️  Global commands may take up to 1 hour to appear`);
+  }
+  
+  console.log('-----------------------------------');
+  console.log('Commands:');
+  commands.forEach((cmd, idx) => {
+    console.log(`  ${idx + 1}. /${cmd.name}`);
+  });
+  console.log('-----------------------------------\n');
 
   try {
-    log.info('Registering slash commands...');
-    await rest.put(Routes.applicationCommands(config.DISCORD_CLIENT_ID), { body: commands });
-    log.info({ count: commands.length }, 'Commands registered successfully');
+    log.info(`Registering ${commands.length} commands (${registrationType})...`);
+    const response = await rest.put(route, { body: commands });
+    
+    console.log('\n✅ COMMAND REGISTRATION SUCCESSFUL');
+    console.log('-----------------------------------');
+    console.log(`Registered: ${commands.length} commands`);
+    console.log(`Type: ${registrationType}`);
+    if (registrationType === 'guild') {
+      console.log(`Guild: ${config.DISCORD_GUILD_ID}`);
+    }
+    console.log('-----------------------------------\n');
+    
+    log.info({ count: commands.length, type: registrationType }, 'Commands registered successfully');
+    return response;
   } catch (error) {
-    log.error({ error: error.message }, 'Failed to register commands');
+    console.error('\n❌ COMMAND REGISTRATION FAILED');
+    console.error('-----------------------------------');
+    console.error(`Error: ${error.message}`);
+    if (error.status) {
+      console.error(`Status: ${error.status}`);
+    }
+    if (error.code) {
+      console.error(`Code: ${error.code}`);
+    }
+    console.error('-----------------------------------\n');
+    
+    log.error({ 
+      error: error.message, 
+      status: error.status,
+      code: error.code,
+      method: error.method,
+      url: error.url
+    }, 'Failed to register commands');
     throw error;
   }
+}
+
+/**
+ * Validate command definitions before registration.
+ */
+function validateCommands(commandDefs) {
+  const errors = [];
+  const names = new Set();
+  
+  for (const cmd of commandDefs) {
+    const name = cmd.name;
+    
+    // Check for duplicate names
+    if (names.has(name)) {
+      errors.push(`Duplicate command name: /${name}`);
+    }
+    names.add(name);
+    
+    // Validate command name format
+    if (!/^[a-z0-9_-]+$/.test(name)) {
+      errors.push(`Invalid command name format: /${name} (must be lowercase alphanumeric with - or _)`);
+    }
+    
+    // Check description
+    if (!cmd.description || cmd.description.length === 0) {
+      errors.push(`Missing description for /${name}`);
+    }
+    
+    if (cmd.description.length > 100) {
+      errors.push(`Description too long for /${name} (max 100 chars)`);
+    }
+  }
+  
+  return {
+    valid: errors.length === 0,
+    errors
+  };
 }
 
 /**

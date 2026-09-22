@@ -16,6 +16,7 @@ const configSchema = z.object({
   // Discord
   DISCORD_TOKEN: z.string().min(1, 'DISCORD_TOKEN is required'),
   DISCORD_CLIENT_ID: z.string().min(1, 'DISCORD_CLIENT_ID is required'),
+  DISCORD_GUILD_ID: z.string().optional(), // Optional: for guild-specific command registration
   ADMIN_ROLE_ID: z.string().min(1, 'ADMIN_ROLE_ID is required'),
 
   // Minecraft
