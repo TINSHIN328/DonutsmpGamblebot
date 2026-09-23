@@ -504,8 +504,4 @@ Private - DonutSMP Server Bot
 
 ## 🙏 Credits
 
-- [Discord.js](https://discord.js.org/) - Discord API wrapper
-- [Mineflayer](https://github.com/PrismarineJS/mineflayer) - Minecraft bot library
-- [better-sqlite3](https://github.com/WiseLibs/better-sqlite3) - SQLite driver
-- [pino](https://getpino.io/) - Fast logger
-- [zod](https://zod.dev/) - Schema validation
+Made by Zyro
