@@ -89,7 +89,7 @@ export function createLinkSession(discordUserId) {
     sessionId: session.sessionId,
     challengeAmount: session.challengeAmount,
     expiresAt: session.expiresAt,
-    botUsername: paymentMonitor.botUsername
+    botUsername: paymentMonitor.botUsername || config.MC_USERNAME
   };
 }
 
