@@ -31,18 +31,25 @@ class PaymentMonitor extends EventEmitter {
     
     // Configurable payment patterns for different server plugins
     // These can be adjusted based on the actual DonutSMP payment message format
+    // Patterns handle Minecraft formatting codes (§), various separators, and amount formats
     this.paymentPatterns = [
-      // Pattern: "PlayerName paid RecipientName $Amount"
-      /^(\w+)\s+paid\s+(\w+)\s+\$?([\d,]+(?:\.\d+)?[kKmMbB]?)$/i,
-      
+      // Pattern: "PlayerName paid RecipientName $Amount" or "PlayerName paid RecipientName Amount"
+      /^(?:§[0-9a-fk-or])*(\w+)(?:§[0-9a-fk-or])*\s+paid\s+(?:§[0-9a-fk-or])*(\w+)(?:§[0-9a-fk-or])*\s+\$?([\d,]+(?:\.\d+)?[kKmMbB]?)$/i,
+
       // Pattern: "Payment of $Amount from PlayerName to RecipientName"
-      /^Payment\s+of\s+\$?([\d,]+(?:\.\d+)?[kKmMbB]?)\s+from\s+(\w+)\s+to\s+(\w+)$/i,
-      
+      /^Payment\s+of\s+\$?([\d,]+(?:\.\d+)?[kKmMbB]?)\s+from\s+(?:§[0-9a-fk-or])*(\w+)\s+to\s+(?:§[0-9a-fk-or])*(\w+)$/i,
+
       // Pattern: "[Economy] PlayerName -> RecipientName: $Amount"
-      /^\[Economy\]\s+(\w+)\s+->\s+(\w+):\s+\$?([\d,]+(?:\.\d+)?[kKmMbB]?)$/i,
-      
+      /^\[Economy\]\s+(?:§[0-9a-fk-or])*(\w+)\s+->\s+(?:§[0-9a-fk-or])*(\w+):\s+\$?([\d,]+(?:\.\d+)?[kKmMbB]?)$/i,
+
       // Pattern: "PlayerName sent $Amount to RecipientName"
-      /^(\w+)\s+sent\s+\$?([\d,]+(?:\.\d+)?[kKmMbB]?)\s+to\s+(\w+)$/i,
+      /^(?:§[0-9a-fk-or])*(\w+)(?:§[0-9a-fk-or])*\s+sent\s+\$?([\d,]+(?:\.\d+)?[kKmMbB]?)\s+to\s+(?:§[0-9a-fk-or])*(\w+)$/i,
+
+      // Pattern: "PlayerName sent Amount to RecipientName" (no $ symbol)
+      /^(?:§[0-9a-fk-or])*(\w+)(?:§[0-9a-fk-or])*\s+sent\s+([\d,]+(?:\.\d+)?[kKmMbB]?)\s+to\s+(?:§[0-9a-fk-or])*(\w+)$/i,
+
+      // Pattern: "PlayerName paid RecipientName Amount" (no $ symbol)
+      /^(?:§[0-9a-fk-or])*(\w+)(?:§[0-9a-fk-or])*\s+paid\s+(?:§[0-9a-fk-or])*(\w+)(?:§[0-9a-fk-or])*\s+([\d,]+(?:\.\d+)?[kKmMbB]?)$/i,
     ];
   }
 
@@ -118,34 +125,45 @@ class PaymentMonitor extends EventEmitter {
    * @returns {Object|null} - Parsed payment or null if not a payment
    */
   parsePaymentMessage(message) {
-    // Clean the message
-    const cleanMessage = message.trim();
+    // Clean the message - remove Minecraft formatting codes and trim whitespace
+    const cleanMessage = this.cleanMinecraftMessage(message);
+
+    // Debug logging for payment detection
+    log.debug({ rawMessage: message, cleanedMessage: cleanMessage }, '[PAYMENT DEBUG] Raw Minecraft message received');
 
     // Try each pattern
-    for (const pattern of this.paymentPatterns) {
+    for (let i = 0; i < this.paymentPatterns.length; i++) {
+      const pattern = this.paymentPatterns[i];
       const match = cleanMessage.match(pattern);
       
       if (match) {
         // Determine which group is sender/recipient/amount based on pattern
         let sender, recipient, amountStr;
 
-        if (pattern === this.paymentPatterns[0]) {
-          // Pattern 1: PlayerName paid RecipientName $Amount
+        if (i === 0 || i === 5) {
+          // Pattern 1 & 6: PlayerName paid RecipientName [Amount/$Amount]
           [, sender, recipient, amountStr] = match;
-        } else if (pattern === this.paymentPatterns[1]) {
+        } else if (i === 1) {
           // Pattern 2: Payment of $Amount from PlayerName to RecipientName
           [, amountStr, sender, recipient] = match;
-        } else if (pattern === this.paymentPatterns[2]) {
+        } else if (i === 2) {
           // Pattern 3: [Economy] PlayerName -> RecipientName: $Amount
           [, sender, recipient, amountStr] = match;
-        } else if (pattern === this.paymentPatterns[3]) {
-          // Pattern 4: PlayerName sent $Amount to RecipientName
+        } else if (i === 3 || i === 4) {
+          // Pattern 4 & 5: PlayerName sent [$Amount/Amount] to RecipientName
           [, sender, amountStr, recipient] = match;
         }
 
         // Parse amount
         try {
           const amount = this.parseAmount(amountStr);
+          
+          log.info({ 
+            sender: sender.trim(),
+            recipient: recipient.trim(),
+            amount,
+            patternIndex: i
+          }, '[PAYMENT DEBUG] Parsed payment');
           
           return {
             sender: sender.trim(),
@@ -162,6 +180,24 @@ class PaymentMonitor extends EventEmitter {
     }
 
     return null;
+  }
+
+  /**
+   * Clean Minecraft message by removing formatting codes
+   * @param {string} message - Raw Minecraft message
+   * @returns {string} - Cleaned message
+   */
+  cleanMinecraftMessage(message) {
+    if (!message) return '';
+    
+    // Remove Minecraft formatting codes (§ followed by 0-9, a-f, k-o, r)
+    let cleaned = message.replace(/§[0-9a-fk-or]/gi, '');
+    
+    // Also handle hex color codes like §#RRGGBB
+    cleaned = cleaned.replace(/§#[0-9a-fA-F]{6}/g, '');
+    
+    // Trim whitespace
+    return cleaned.trim();
   }
 
   /**
@@ -221,6 +257,8 @@ class PaymentMonitor extends EventEmitter {
    * @param {string} paymentHash - Unique payment hash
    */
   matchPayment(payment, paymentHash) {
+    log.debug({ payment, paymentHash }, '[PAYMENT DEBUG] Matching payment against sessions');
+    
     // First, try to match against link sessions
     const linkMatch = this.matchLinkSession(payment);
     
@@ -245,6 +283,13 @@ class PaymentMonitor extends EventEmitter {
       // Successful match
       const session = linkMatch.session;
       
+      log.info({ 
+        payment,
+        sessionId: session.session_id,
+        discordUserId: session.discord_user_id,
+        challengeAmount: session.challenge_amount
+      }, '[PAYMENT DEBUG] Matching link session found');
+      
       // Mark as processed
       db.recordProcessedPayment(paymentHash, payment.sender, null, payment.recipient, payment.amount, 'LINK', session.session_id);
       
@@ -256,7 +301,7 @@ class PaymentMonitor extends EventEmitter {
           discordUserId: session.discord_user_id,
           minecraftUsername: payment.sender,
           challengeAmount: session.challenge_amount
-        }, 'Link session completed successfully');
+        }, '[LINK SUCCESS] Discord user linked Minecraft account');
         
         // Emit success event
         this.emit('link-success', {
